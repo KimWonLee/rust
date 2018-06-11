@@ -1244,6 +1244,7 @@ pub fn force_from_dep_node<'a, 'gcx, 'lcx>(tcx: TyCtxt<'a, 'gcx, 'lcx>,
         DepKind::MirBorrowCheck => { force!(mir_borrowck, def_id!()); }
         DepKind::UnsafetyCheckResult => { force!(unsafety_check_result, def_id!()); }
         DepKind::UnsafeDeriveOnReprPacked => { force!(unsafe_derive_on_repr_packed, def_id!()); }
+        DepKind::LintMod => { force!(lint_mod, def_id!()); }
         DepKind::CheckModAttrs => { force!(check_mod_attrs, def_id!()); }
         DepKind::CheckModLoops => { force!(check_mod_loops, def_id!()); }
         DepKind::CheckModUnstableApiUsage => { force!(check_mod_unstable_api_usage, def_id!()); }
