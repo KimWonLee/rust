@@ -2854,28 +2854,18 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     pub fn lint_level_at_node(self, lint: &'static Lint, mut id: NodeId)
         -> (lint::Level, lint::LintSource)
     {
-        // Right now we insert a `with_ignore` node in the dep graph here to
-        // ignore the fact that `lint_levels` below depends on the entire crate.
-        // For now this'll prevent false positives of recompiling too much when
-        // anything changes.
-        //
-        // Once red/green incremental compilation lands we should be able to
-        // remove this because while the crate changes often the lint level map
-        // will change rarely.
-        self.dep_graph.with_ignore(|| {
-            let sets = self.lint_levels(LOCAL_CRATE);
-            loop {
-                let hir_id = self.hir().definitions().node_to_hir_id(id);
-                if let Some(pair) = sets.level_and_source(lint, hir_id, self.sess) {
-                    return pair
-                }
-                let next = self.hir().get_parent_node(id);
-                if next == id {
-                    bug!("lint traversal reached the root of the crate");
-                }
-                id = next;
+        let sets = self.lint_levels(LOCAL_CRATE);
+        loop {
+            let hir_id = self.hir().definitions().node_to_hir_id(id);
+            if let Some(pair) = sets.level_and_source(lint, hir_id, self.sess) {
+                return pair
             }
-        })
+            let next = self.hir().get_parent_node(id);
+            if next == id {
+                bug!("lint traversal reached the root of the crate");
+            }
+            id = next;
+        }
     }
 
     pub fn struct_span_lint_hir<S: Into<MultiSpan>>(self,

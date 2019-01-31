@@ -27,6 +27,8 @@ use rustc_serialize::{Decoder, Decodable, Encoder, Encodable};
 use session::{config, early_error, Session};
 use ty::{self, TyCtxt, Ty};
 use ty::layout::{LayoutError, LayoutOf, TyLayout};
+use ty::query::{Providers, queries};
+
 use util::nodemap::FxHashMap;
 use util::common::time;
 
@@ -36,10 +38,12 @@ use syntax::edition;
 use syntax_pos::{MultiSpan, Span, symbol::{LocalInternedString, Symbol}};
 use errors::DiagnosticBuilder;
 use hir;
+use hir::def_id::DefId;
 use hir::def_id::LOCAL_CRATE;
 use hir::intravisit as hir_visit;
 use syntax::util::lev_distance::find_best_match_for_name;
 use syntax::visit as ast_visit;
+use syntax::ast::{NodeId, CRATE_NODE_ID};
 
 /// Information about the registered lints.
 ///
@@ -55,6 +59,7 @@ pub struct LintStore {
     pre_expansion_passes: Option<Vec<EarlyLintPassObject>>,
     early_passes: Option<Vec<EarlyLintPassObject>>,
     late_passes: Option<Vec<LateLintPassObject>>,
+    late_module_passes: Option<Vec<LateLintPassObject>>,
 
     /// Lints indexed by name.
     by_name: FxHashMap<String, TargetLint>,
@@ -150,6 +155,7 @@ impl LintStore {
             pre_expansion_passes: Some(vec![]),
             early_passes: Some(vec![]),
             late_passes: Some(vec![]),
+            late_module_passes: Some(vec![]),
             by_name: Default::default(),
             future_incompatible: Default::default(),
             lint_groups: Default::default(),
@@ -199,9 +205,14 @@ impl LintStore {
     pub fn register_late_pass(&mut self,
                               sess: Option<&Session>,
                               from_plugin: bool,
+                              per_module: bool,
                               pass: LateLintPassObject) {
         self.push_pass(sess, from_plugin, &pass);
-        self.late_passes.as_mut().unwrap().push(pass);
+        if per_module {
+            self.late_module_passes.as_mut().unwrap().push(pass);
+        } else {
+            self.late_passes.as_mut().unwrap().push(pass);
+        }
     }
 
     // Helper method for register_early/late_pass
@@ -508,6 +519,7 @@ pub struct LateContext<'a, 'tcx: 'a> {
     pub tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     /// Side-tables for the body we are in.
+    // FIXME: Make this lazy to avoid running the TypeckTables query?
     pub tables: &'a ty::TypeckTables<'tcx>,
 
     /// Parameter environment for the item we are in.
@@ -523,6 +535,9 @@ pub struct LateContext<'a, 'tcx: 'a> {
 
     /// Generic type parameters in scope for the item we are in.
     pub generics: Option<&'tcx hir::Generics>,
+
+    /// We are only looking at one module
+    only_module: bool,
 }
 
 /// Context for lint checking of the AST, after expansion, before lowering to
@@ -801,6 +816,12 @@ impl<'a, 'tcx> LateContext<'a, 'tcx> {
     pub fn current_lint_root(&self) -> ast::NodeId {
         self.last_ast_node_with_lint_attrs
     }
+
+    fn process_mod(&mut self, m: &'tcx hir::Mod, s: Span, n: ast::NodeId) {
+        run_lints!(self, check_mod, m, s, n);
+        hir_visit::walk_mod(self, m, n);
+        run_lints!(self, check_mod_post, m, s, n);
+    }
 }
 
 impl<'a, 'tcx> LayoutOf for LateContext<'a, 'tcx> {
@@ -932,9 +953,9 @@ impl<'a, 'tcx> hir_visit::Visitor<'tcx> for LateContext<'a, 'tcx> {
     }
 
     fn visit_mod(&mut self, m: &'tcx hir::Mod, s: Span, n: ast::NodeId) {
-        run_lints!(self, check_mod, m, s, n);
-        hir_visit::walk_mod(self, m, n);
-        run_lints!(self, check_mod_post, m, s, n);
+        if !self.only_module {
+            self.process_mod(m, s, n);
+        }
     }
 
     fn visit_local(&mut self, l: &'tcx hir::Local) {
@@ -1199,11 +1220,65 @@ impl<'a, T: EarlyLintPass> ast_visit::Visitor<'a> for EarlyContextAndPass<'a, T>
     }
 }
 
+pub fn lint_mod<'tcx>(tcx: TyCtxt<'_, 'tcx, 'tcx>, module_def_id: DefId) {
+    fn find_last_node_with_lint_attrs<'tcx>(
+        tcx: TyCtxt<'_, 'tcx, 'tcx>,
+        mut id: NodeId
+    ) -> NodeId {
+        let sets = tcx.lint_levels(LOCAL_CRATE);
+        loop {
+            let hir_id = tcx.hir().node_to_hir_id(id);
+            if sets.lint_level_set(hir_id).is_some() {
+                return id
+            }
+            let next = tcx.hir().get_parent_node(id);
+            if next == id {
+                return CRATE_NODE_ID;
+            }
+            id = next;
+        }
+    }
 
-/// Perform lint checking on a crate.
-///
-/// Consumes the `lint_store` field of the `Session`.
-pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
+    // Restricts this to only items in this module
+    let access_levels = &tcx.privacy_access_levels(LOCAL_CRATE);
+
+    let store = &tcx.sess.lint_store;
+    let passes = store.borrow_mut().late_module_passes.take();
+
+    let mut cx = LateContext {
+        tcx,
+        tables: &ty::TypeckTables::empty(None),
+        param_env: ty::ParamEnv::empty(),
+        access_levels,
+        lint_sess: LintSession {
+            lints: store.borrow(),
+            passes,
+        },
+        last_ast_node_with_lint_attrs: find_last_node_with_lint_attrs(
+            tcx,
+            tcx.hir().as_local_node_id(module_def_id).unwrap(),
+        ),
+        generics: None,
+        only_module: true,
+    };
+
+    let (module, span, node_id) = tcx.hir().get_module(module_def_id);
+    cx.process_mod(module, span, node_id);
+
+    // Put the lint store levels and passes back in the session.
+    let passes = cx.lint_sess.passes;
+    drop(cx.lint_sess.lints);
+    store.borrow_mut().late_module_passes = passes;
+}
+
+pub(crate) fn provide(providers: &mut Providers<'_>) {
+    *providers = Providers {
+        lint_mod,
+        ..*providers
+    };
+}
+
+fn lint_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     let access_levels = &tcx.privacy_access_levels(LOCAL_CRATE);
 
     let krate = tcx.hir().krate();
@@ -1221,6 +1296,7 @@ pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
             },
             last_ast_node_with_lint_attrs: ast::CRATE_NODE_ID,
             generics: None,
+            only_module: false,
         };
 
         // Visit the whole crate.
@@ -1238,6 +1314,17 @@ pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
 
     // Put the lint store levels and passes back in the session.
     tcx.sess.lint_store.borrow_mut().late_passes = passes;
+}
+
+/// Perform lint checking on a crate.
+pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
+    // Run per-module lints
+    for &module in tcx.hir().krate().modules.keys() {
+        queries::lint_mod::ensure(tcx, tcx.hir().local_def_id(module));
+    }
+
+    // Run whole crate non-incremental lints
+    lint_crate(tcx);
 }
 
 struct EarlyLintPassObjects<'a> {
